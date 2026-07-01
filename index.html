@@ -538,6 +538,22 @@
       scroll-behavior: auto !important;
     }
   }
+
+  /* =========================================================================
+     INDICADOR DE SINCRONIZACIÓN (datos compartidos)
+     ========================================================================= */
+  .sync-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 700;
+    padding: 6px 11px; border-radius: 999px;
+    background: #e7eefc; color: #2748a0; white-space: nowrap;
+    transition: background var(--t), color var(--t);
+  }
+  .sync-badge::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .sync-badge.ok   { background: var(--prio-baja-bg);  color: var(--verde-osc); }
+  .sync-badge.warn { background: var(--prio-media-bg); color: var(--prio-media-tx); }
+  .sync-badge.busy::before { animation: syncPing 1s ease-in-out infinite; }
+  @keyframes syncPing { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
 </style>
 </head>
 
@@ -615,6 +631,8 @@
       <button class="btn btn-ghost" id="btnExportar">⬇ Exportar JSON</button>
       <button class="btn btn-ghost" id="btnImportar">⬆ Importar JSON</button>
       <input type="file" id="inputImport" accept="application/json,.json" />
+      <button class="btn btn-ghost" id="btnActualizar" title="Traer los últimos cambios del equipo">⟳ Actualizar</button>
+      <span class="sync-badge busy" id="syncBadge">Conectando…</span>
     </div>
 
     <!-- ====================== TABLA ====================== -->
@@ -1298,6 +1316,101 @@ byId("inputImport").addEventListener("change", function (e) {
 cargar();             /* lee localStorage (tolerante a vacío/corrupto) */
 renderTabla();        /* pinta la tabla y anima barras */
 actualizarResumen();  /* conteo animado de las tarjetas de resumen */
+
+/* ===========================================================================
+   SINCRONIZACIÓN CON EL ALMACÉN CENTRAL (datos compartidos)
+   ---------------------------------------------------------------------------
+   · localStorage se conserva como CACHÉ local (pintado instantáneo + modo
+     offline si el archivo se abre localmente o falla la red).
+   · La fuente de verdad es el servidor (/api/data), que todos comparten.
+   · Guardado: cada cambio empuja TODO el arreglo al servidor (con retardo).
+   · Lectura: al iniciar y cada 15 s se traen los cambios de otras personas
+     (sin pisar lo que estés editando en ese momento).
+   =========================================================================== */
+var API_DATOS = "/api/data";
+var syncPushTimer = null;
+var suprimirPush = false;   /* evita re-empujar cuando aplicamos datos remotos */
+
+/* Actualiza el pequeño indicador de estado de la barra. */
+function marcarSync(texto, clase) {
+  var b = byId("syncBadge");
+  if (!b) return;
+  b.textContent = texto;
+  b.className = "sync-badge" + (clase ? " " + clase : "");
+}
+
+/* ¿El usuario está editando ahora? (para no pisar su trabajo al sincronizar) */
+function hayEdicionEnCurso() {
+  var a = document.activeElement;
+  var editando = a && (a.tagName === "INPUT" || a.tagName === "TEXTAREA" || a.tagName === "SELECT");
+  var modalAbierto = byId("modalOverlay").classList.contains("abierto");
+  return editando || modalAbierto;
+}
+
+/* Guardar local original (definido antes). Lo envolvemos para además empujar. */
+var _guardarLocal = guardar;
+guardar = function () {
+  _guardarLocal();                 /* caché en localStorage (instantáneo) */
+  if (suprimirPush) return;
+  clearTimeout(syncPushTimer);
+  syncPushTimer = setTimeout(empujarServidor, 800);  /* empuje con retardo */
+};
+
+/* Envía TODO el arreglo de productos al almacén central. */
+function empujarServidor() {
+  marcarSync("Guardando…", "busy");
+  fetch(API_DATOS, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ productos: productos })
+  })
+  .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+  .then(function () { marcarSync("Sincronizado", "ok"); })
+  .catch(function () { marcarSync("Sin conexión (guardado local)", "warn"); });
+}
+
+/* Trae los datos del almacén central y los aplica si cambió algo. */
+function sincronizarDesdeServidor(silencioso) {
+  if (!silencioso) marcarSync("Actualizando…", "busy");
+  fetch(API_DATOS)
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) {
+      var remoto = (data && Object.prototype.hasOwnProperty.call(data, "productos")) ? data.productos : undefined;
+
+      /* Clave inexistente en el servidor (primera vez): sembramos con lo local. */
+      if (remoto === null) {
+        if (productos.length) empujarServidor();
+        else marcarSync("Sincronizado", "ok");
+        return;
+      }
+      if (!Array.isArray(remoto)) { marcarSync("Sincronizado", "ok"); return; }
+
+      /* No pisar edición en curso: reintentaremos en el próximo ciclo. */
+      if (hayEdicionEnCurso()) { marcarSync("Sincronizado", "ok"); return; }
+
+      var normalizado = remoto.map(normalizar);
+      if (JSON.stringify(productos) === JSON.stringify(normalizado)) {
+        marcarSync("Sincronizado", "ok");
+        return;
+      }
+      suprimirPush = true;
+      productos = normalizado;
+      _guardarLocal();            /* refresca la caché local */
+      renderTabla();
+      actualizarResumen();
+      suprimirPush = false;
+      marcarSync("Actualizado", "ok");
+    })
+    .catch(function () { marcarSync("Sin conexión (datos locales)", "warn"); });
+}
+
+/* Botón manual "Actualizar" */
+byId("btnActualizar").addEventListener("click", function () { sincronizarDesdeServidor(false); });
+
+/* Sincronización inicial + sondeo periódico para ver cambios del equipo. */
+sincronizarDesdeServidor(false);
+setInterval(function () { sincronizarDesdeServidor(true); }, 15000);
+
 </script>
 </body>
 </html>
